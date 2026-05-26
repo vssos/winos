@@ -56,15 +56,16 @@ jobs:
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Continue'
-          $all = gh run list --branch ${{ github.ref_name }} --json databaseId,conclusion,createdAt,updatedAt,startedAt,workflowName --limit 100 | ConvertFrom-Json
+          # 修改点 1：确保 gh 命令作用于你自己的仓库
+          $all = gh run list --repo "${{ github.repository }}" --branch ${{ github.ref_name }} --json databaseId,conclusion,createdAt,updatedAt,startedAt,workflowName --limit 100 | ConvertFrom-Json
           Write-Host "Total runs: $($all.Count)"
           $api = "https://api.github.com/repos/${{ github.repository }}/actions/runs"
           $deleted = New-Object 'System.Collections.Generic.HashSet[long]'
-          # Delete failed/cancelled/timed_out — separate pass by age: old first to avoid hitting max deletions
+          # Delete failed/cancelled/timed_out
           $all | Where-Object { $_.conclusion -in @('failure','cancelled','timed_out') } | Sort-Object createdAt | ForEach-Object { Write-Host "Delete: $($_.databaseId)"; try { Invoke-RestMethod -Method Delete -Uri "$api/$($_.databaseId)" -Headers @{Authorization = "token $env:GH_TOKEN"} -ErrorAction Stop; [void]$deleted.Add($_.databaseId); Write-Host "  OK" } catch { Write-Host "  FAIL: $($_.Exception.Message)" } }
-          # Delete short-duration runs (< 3 min) — meta4 check with nothing to build
+          # Delete short-duration runs (< 3 min)
           $all | Where-Object { $_.updatedAt -and $_.startedAt -and ([DateTime]::Parse($_.updatedAt) - [DateTime]::Parse($_.startedAt)).TotalMinutes -lt 3 } | ForEach-Object { Write-Host "Delete short: $($_.databaseId)"; try { Invoke-RestMethod -Method Delete -Uri "$api/$($_.databaseId)" -Headers @{Authorization = "token $env:GH_TOKEN"} -ErrorAction Stop; [void]$deleted.Add($_.databaseId); Write-Host "  OK" } catch { Write-Host "  FAIL: $($_.Exception.Message)" } }
-          # Keep 10 newest from remaining (skip already-deleted)
+          # Keep 10 newest from remaining
           $good = $all | Where-Object { $_.conclusion -notin @('failure','cancelled','timed_out') -and -not $deleted.Contains($_.databaseId) }
           Write-Host "Good runs after cleanup (keep 10 of $($good.Count))"
           $good | Select-Object -Skip 10 | ForEach-Object { Write-Host "Delete old: $($_.databaseId)"; try { Invoke-RestMethod -Method Delete -Uri "$api/$($_.databaseId)" -Headers @{Authorization = "token $env:GH_TOKEN"} -ErrorAction Stop; Write-Host "  OK" } catch { Write-Host "  FAIL: $($_.Exception.Message)" } }
@@ -99,7 +100,7 @@ jobs:
           $meta4 = Invoke-RestMethodWithRetry "https://api.github.com/repos/adavak/Win_ISO_Patching_Scripts/contents/Scripts/${{ matrix.version.meta4_file }}"
           "sha=$($meta4.sha)" >> $env:GITHUB_OUTPUT
 
-      # 3. Read last meta4 SHA from Release body (vssos/winos)
+      # 3. Read last meta4 SHA from Release body
       - name: Read last meta4 SHA
         id: last
         shell: pwsh
@@ -110,7 +111,10 @@ jobs:
           $api = "https://api.github.com/repos/$repo/releases?per_page=50"
 
           try {
-            $releases = Invoke-RestMethod $api
+            # 修改点 2：为 API 请求添加 GitHub Token 认证，防止自己仓库无 Release 时或频繁请求导致限流 (HTTP 403)
+            $headers = @{}
+            if ("${{ secrets.GITHUB_TOKEN }}") { $headers["Authorization"] = "token ${{ secrets.GITHUB_TOKEN }}" }
+            $releases = Invoke-RestMethod -Uri $api -Headers $headers
 
             $matched = $releases |
               Where-Object { $_.tag_name -like "$prefix*" } |
@@ -147,7 +151,7 @@ jobs:
         run: |
           New-Item -ItemType Directory -Force -Path download, patcher, release
 
-      # 5. Clone patch scripts
+      # 5. Clone patch scripts (with retry to avoid hangs)
       - name: Clone patch scripts
         if: steps.check.outputs.run == 'true'
         shell: pwsh
@@ -171,7 +175,7 @@ jobs:
             }
           }
 
-      # 6. Download split ISO zip parts from win_iso_zip (keep original source)
+      # 6. Download split ISO zip parts
       - name: Download ISO zip parts
         if: steps.check.outputs.run == 'true'
         shell: pwsh
@@ -296,7 +300,9 @@ jobs:
           body: |
             ISO SHA256: ${{ steps.iso.outputs.iso_sha256 }}
 
-            files: |
-                    release/*
+            <!-- STATE
+            META4_SHA=${{ steps.script.outputs.sha }}
+            -->
+            files: release/*.zip.*
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
