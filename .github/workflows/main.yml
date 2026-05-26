@@ -296,6 +296,7 @@ jobs:
           body: |
             ISO SHA256: ${{ steps.iso.outputs.iso_sha256 }}
 
-            files: release/*.zip.*
+            files: |
+                    release/*
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
