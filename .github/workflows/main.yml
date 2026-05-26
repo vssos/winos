@@ -303,6 +303,6 @@ jobs:
             <!-- STATE
             META4_SHA=${{ steps.script.outputs.sha }}
             -->
-            files: release/*.zip.*
+          files: release/*.zip.*
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
