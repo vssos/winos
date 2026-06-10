@@ -297,8 +297,8 @@ jobs:
             ISO SHA256: ${{ steps.iso.outputs.iso_sha256 }}
 
             <!-- STATE
-            META4_SHA=${{ steps.script.outputs.sha }}
-            -->	
-            files: release/*.zip.*
+            META4_HASH=${{ steps.script.outputs.hash }}
+            -->
+          files: release/*.zip.*
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
