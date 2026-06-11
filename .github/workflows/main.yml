@@ -2,8 +2,6 @@ name: Windows ISO Auto Patch (All Versions)
 
 on:
   workflow_dispatch:
-  schedule:
-    - cron: "30 0,16,18,20,22 * * *"
 
 permissions:
   contents: write
@@ -56,12 +54,15 @@ jobs:
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Continue'
-          $all = gh run list --repo "${{ github.repository }}" --branch ${{ github.ref_name }} --json databaseId,conclusion,createdAt,updatedAt,startedAt,workflowName --limit 100 | ConvertFrom-Json
+          $all = gh run list --branch ${{ github.ref_name }} --json databaseId,conclusion,createdAt,updatedAt,startedAt,workflowName --limit 100 | ConvertFrom-Json
           Write-Host "Total runs: $($all.Count)"
           $api = "https://api.github.com/repos/${{ github.repository }}/actions/runs"
           $deleted = New-Object 'System.Collections.Generic.HashSet[long]'
+          # Delete failed/cancelled/timed_out — separate pass by age: old first to avoid hitting max deletions (assumed ~50/mo for this strategy)
           $all | Where-Object { $_.conclusion -in @('failure','cancelled','timed_out') } | Sort-Object createdAt | ForEach-Object { Write-Host "Delete: $($_.databaseId)"; try { Invoke-RestMethod -Method Delete -Uri "$api/$($_.databaseId)" -Headers @{Authorization = "token $env:GH_TOKEN"} -ErrorAction Stop; [void]$deleted.Add($_.databaseId); Write-Host "  OK" } catch { Write-Host "  FAIL: $($_.Exception.Message)" } }
+          # Delete short-duration runs (< 3 min) — meta4 check with nothing to build
           $all | Where-Object { $_.updatedAt -and $_.startedAt -and ([DateTime]::Parse($_.updatedAt) - [DateTime]::Parse($_.startedAt)).TotalMinutes -lt 3 } | ForEach-Object { Write-Host "Delete short: $($_.databaseId)"; try { Invoke-RestMethod -Method Delete -Uri "$api/$($_.databaseId)" -Headers @{Authorization = "token $env:GH_TOKEN"} -ErrorAction Stop; [void]$deleted.Add($_.databaseId); Write-Host "  OK" } catch { Write-Host "  FAIL: $($_.Exception.Message)" } }
+          # Keep 10 newest from remaining (skip already-deleted)
           $good = $all | Where-Object { $_.conclusion -notin @('failure','cancelled','timed_out') -and -not $deleted.Contains($_.databaseId) }
           Write-Host "Good runs after cleanup (keep 10 of $($good.Count))"
           $good | Select-Object -Skip 10 | ForEach-Object { Write-Host "Delete old: $($_.databaseId)"; try { Invoke-RestMethod -Method Delete -Uri "$api/$($_.databaseId)" -Headers @{Authorization = "token $env:GH_TOKEN"} -ErrorAction Stop; Write-Host "  OK" } catch { Write-Host "  FAIL: $($_.Exception.Message)" } }
@@ -72,17 +73,15 @@ jobs:
         shell: pwsh
         run: Write-Host "Starting ${{ matrix.version.name }} Auto Patch workflow"
 
-      # 2. Get latest meta4 file SHA from Win_ISO_Patching_Scripts
-      - name: Get patch script meta4 file SHA
+      # 2. Get latest meta4 file hash (order-independent) from Win_ISO_Patching_Scripts
+      - name: Get patch script meta4 file hash
         id: script
         shell: pwsh
         run: |
           function Invoke-RestMethodWithRetry([string]$uri, [int]$maxAttempts=5, [int]$delaySeconds=120) {
-            $headers = @{}
-            if ("${{ secrets.GITHUB_TOKEN }}") { $headers["Authorization"] = "token ${{ secrets.GITHUB_TOKEN }}" }
             for ($i = 1; $i -le $maxAttempts; $i++) {
               try {
-                return Invoke-RestMethod -Uri $uri -Headers $headers
+                return Invoke-RestMethod $uri
               } catch {
                 Write-Host "Invoke-RestMethod failed (attempt $i/$maxAttempts): $($_.Exception.Message)"
                 if ($i -lt $maxAttempts) {
@@ -96,10 +95,16 @@ jobs:
           }
 
           $meta4 = Invoke-RestMethodWithRetry "https://api.github.com/repos/adavak/Win_ISO_Patching_Scripts/contents/Scripts/${{ matrix.version.meta4_file }}"
-          "sha=$($meta4.sha)" >> $env:GITHUB_OUTPUT
+          $xmlText = [System.Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($meta4.content))
+          $names = [regex]::Matches($xmlText, 'file name="([^"]+)"') | ForEach-Object { $_.Groups[1].Value }
+          $sorted = $names | Sort-Object { [int]($_ -replace '^.*kb(\d+).*$', '$1') }
+          $combined = $sorted -join '|'
+          $hashBytes = [System.Security.Cryptography.SHA256]::Create().ComputeHash([System.Text.Encoding]::UTF8.GetBytes($combined))
+          $hash = [System.BitConverter]::ToString($hashBytes).Replace('-', '').ToLower()
+          "hash=$hash" >> $env:GITHUB_OUTPUT
 
-      # 3. Read last meta4 SHA from Release body
-      - name: Read last meta4 SHA
+      # 3. Read last meta4 hash from Release body
+      - name: Read last meta4 hash
         id: last
         shell: pwsh
         run: |
@@ -109,29 +114,27 @@ jobs:
           $api = "https://api.github.com/repos/$repo/releases?per_page=50"
 
           try {
-            $headers = @{}
-            if ("${{ secrets.GITHUB_TOKEN }}") { $headers["Authorization"] = "token ${{ secrets.GITHUB_TOKEN }}" }
-            $releases = Invoke-RestMethod -Uri $api -Headers $headers
+            $releases = Invoke-RestMethod $api
 
             $matched = $releases |
               Where-Object { $_.tag_name -like "$prefix*" } |
               Sort-Object published_at -Descending |
               Select-Object -First 1
 
-            if ($matched -and $matched.body -match 'META4_SHA=([a-f0-9]{40})') {
-              "sha=$($matches[1])" >> $env:GITHUB_OUTPUT
+            if ($matched -and $matched.body -match 'META4_HASH=([a-f0-9]{64})') {
+              "hash=$($matches[1])" >> $env:GITHUB_OUTPUT
             } else {
-              "sha=" >> $env:GITHUB_OUTPUT
+              "hash=" >> $env:GITHUB_OUTPUT
             }
           } catch {
-            "sha=" >> $env:GITHUB_OUTPUT
+            "hash=" >> $env:GITHUB_OUTPUT
           }
 
       - name: Check if workflow should run
         id: check
         shell: pwsh
         run: |
-          if ("${{ steps.script.outputs.sha }}" -eq "${{ steps.last.outputs.sha }}") {
+          if ("${{ steps.script.outputs.hash }}" -eq "${{ steps.last.outputs.hash }}") {
             "run=false" >> $env:GITHUB_OUTPUT
           } else {
             "run=true" >> $env:GITHUB_OUTPUT
@@ -148,7 +151,7 @@ jobs:
         run: |
           New-Item -ItemType Directory -Force -Path download, patcher, release
 
-      # 5. Clone patch scripts
+      # 5. Clone patch scripts (with retry to avoid hangs)
       - name: Clone patch scripts
         if: steps.check.outputs.run == 'true'
         shell: pwsh
@@ -179,11 +182,9 @@ jobs:
         run: |
           $ProgressPreference = 'SilentlyContinue'
           function Invoke-RestMethodWithRetry([string]$uri, [int]$maxAttempts=5, [int]$delaySeconds=120) {
-            $headers = @{}
-            if ("${{ secrets.GITHUB_TOKEN }}") { $headers["Authorization"] = "token ${{ secrets.GITHUB_TOKEN }}" }
             for ($i = 1; $i -le $maxAttempts; $i++) {
               try {
-                return Invoke-RestMethod -Uri $uri -Headers $headers
+                return Invoke-RestMethod $uri
               } catch {
                 Write-Host "Invoke-RestMethod failed (attempt $i/$maxAttempts): $($_.Exception.Message)"
                 if ($i -lt $maxAttempts) {
@@ -227,7 +228,7 @@ jobs:
           $actual = ($hashMatches | Select-Object -First 1).Trim().ToLower()
           if ($actual -ne "${{ matrix.version.expected_hash }}") { throw "SHA256 mismatch: $actual" }
 
-      # 9. Run Start.cmd
+      # 9. Run Start.cmd (auto exit via choice 9)
       - name: Run Start.cmd
         if: steps.check.outputs.run == 'true'
         shell: cmd
@@ -248,12 +249,14 @@ jobs:
           $sevenZip = "${{ env.SEVENZIP }}"
           $iso = Get-ChildItem patcher -Filter *.iso -Recurse | Sort-Object LastWriteTime -Descending | Select-Object -First 1
 
+          # Version/build and locale
           if ($iso.Name -match '(\d{1,6}\.\d{1,6})') { $versionBuild = $matches[1]; $version,$build=$versionBuild -split '\.' }
           if ($iso.Name -match '([A-Za-z]+-[A-Za-z]+)') { $locale = $matches[1].ToLower() }
 
           $date = Get-Date -Format "yyMMdd"
           $time = "0800"
 
+          # 7z SHA256
           $hashOutput = & $sevenZip h -scrcSHA256 "$($iso.FullName)"
           $hashMatches = $hashOutput | Select-String -Pattern '([a-fA-F0-9]{64})' | ForEach-Object { $_.Matches[0].Value }
           $hash = ($hashMatches | Select-Object -First 1).Trim().ToLower()
@@ -263,6 +266,7 @@ jobs:
           $newName = "$version.$build.$date-$time.${{ matrix.version.iso_label }}_${locale}_$hash8.iso"
           Rename-Item -Path $iso.FullName -NewName $newName
 
+          # Split using 7z
           & $sevenZip a "release\$newName.zip" "patcher\$newName" -v${{ env.SPLIT_SIZE }}
 
           $runTimeTag = (Get-Date).ToString("yyyyMMdd-HHmm")
